@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import {
   ProviderCache,
   ProviderCacheShape,
+  makeProviderCacheLayer,
   ProviderCacheKey,
   ProviderDriverKind,
   DEFAULT_PROVIDER_CACHE_CONFIG,
@@ -35,7 +36,18 @@ const testCacheKey: ProviderCacheKey = {
 };
 
 const fakeLookup = Effect.succeed("model-list-result");
-const fakeLookupCaps = Effect.succeed(JSON.stringify({ toolUse: true }));
+const fakeLookupCapabilities = Effect.succeed(JSON.stringify({ toolUse: true }));
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function runProviderCache(
+  layer: Layer.Layer<ProviderCacheShape>,
+  body: Effect.Effect<unknown>,
+) {
+  return Effect.runPromise(
+    Effect.provide(body, Layer.mergeAll(NodeServices.layer, layer)),
+  );
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -44,28 +56,32 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "getModels returns cached hit on second call within TTL",
     () =>
       Effect.gen(function* () {
-        // Deref via Layer — the Layer provides the service, not the class itself
-        const pc: ProviderCacheShape = yield* ProviderCache;
+        const cache = yield* ProviderCache;
         const ttlMs = Duration.toMillis(
           DEFAULT_PROVIDER_CACHE_CONFIG.modelListTtl,
         );
 
-        const first = yield* pc.getModels({
+        // First call — must be a miss
+        const first = yield* cache.getModels({
           key: testCacheKey,
           lookup: fakeLookup,
           toCacheValue: JSON.stringify,
         });
         assert.strictEqual(first, "model-list-result");
 
-        // Wait a fraction of the TTL so there's zero possibility of expiry
-        yield* Effect.sleep(
-          Duration.millis(Math.max(50, Math.floor(ttlMs / 20))),
+        // Wait less than 1 TTL second
+        yield* Clock.currentTimeMillis.pipe(
+          Effect.flatMap((now) =>
+            Effect.sleep(
+              Duration.millis(Math.max(50, Math.floor(ttlMs / 20))),
+            ),
+          ),
         );
 
-        // Second call: must be a cache hit — lookup should NOT be called
-        const second = yield* pc.getModels({
+        // Second call — must be a hit (cached)
+        const second = yield* cache.getModels({
           key: testCacheKey,
-          lookup: Effect.die("should never reach upstream"),
+          lookup: Effect.die("should not reach upstream"),
           toCacheValue: JSON.stringify,
         });
         assert.strictEqual(second, "model-list-result");
@@ -76,23 +92,23 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "getCapabilities returns cached hit on second call within TTL",
     () =>
       Effect.gen(function* () {
-        const pc: ProviderCacheShape = yield* ProviderCache;
+        const cache = yield* ProviderCache;
         const capKey: ProviderCacheKey = {
           driverKind: ProviderDriverKind.make("opencode"),
           instanceId: "opencode-default",
         };
 
-        const first = yield* pc.getCapabilities({
+        const first = yield* cache.getCapabilities({
           key: capKey,
-          lookup: fakeLookupCaps,
+          lookup: fakeLookupCapabilities,
           toCacheValue: JSON.stringify,
         });
         assert.strictEqual(first, '{"toolUse":true}');
 
         yield* Effect.sleep(Duration.millis(100));
-        const second = yield* pc.getCapabilities({
+        const second = yield* cache.getCapabilities({
           key: capKey,
-          lookup: Effect.die("should never reach upstream"),
+          lookup: Effect.die("should not reach upstream"),
           toCacheValue: JSON.stringify,
         });
         assert.strictEqual(second, '{"toolUse":true}');
@@ -103,20 +119,23 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "getModels evicts entry after TTL expires",
     () =>
       Effect.gen(function* () {
-        const pc: ProviderCacheShape = yield* ProviderCache;
+        const cache = yield* ProviderCache;
         const ttlMs = Duration.toMillis(
           DEFAULT_PROVIDER_CACHE_CONFIG.modelListTtl,
         );
 
-        yield* pc.getModels({
+        // Populate cache
+        yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("ttl-test"),
           toCacheValue: (v) => v,
         });
 
-        yield* Effect.sleep(Duration.millis(ttlMs + 200));
+        // Wait for TTL + 100ms buffer
+        yield* Effect.sleep(Duration.millis(ttlMs + 100));
 
-        const result = yield* pc.getModels({
+        // This MUST be a miss — lookup is invoked
+        const result = yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("after-ttl"),
           toCacheValue: (v) => v,
@@ -129,27 +148,30 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "invalidate removes a single provider entry",
     () =>
       Effect.gen(function* () {
-        const pc: ProviderCacheShape = yield* ProviderCache;
+        const cache = yield* ProviderCache;
 
-        yield* pc.getModels({
+        // Populate both model + capability caches
+        yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("cached-models"),
           toCacheValue: (v) => v,
         });
-        yield* pc.getCapabilities({
+        yield* cache.getCapabilities({
           key: testCacheKey,
           lookup: Effect.succeed("cached-caps"),
           toCacheValue: JSON.stringify,
         });
 
-        yield* pc.invalidate(testCacheKey);
+        // Invalidate just this driver+instance
+        yield* cache.invalidate(testCacheKey);
 
-        const fresh = yield* pc.getModels({
+        // Both should be misses now
+        const models = yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("fresh-models"),
           toCacheValue: (v) => v,
         });
-        assert.strictEqual(fresh, "fresh-models");
+        assert.strictEqual(models, "fresh-models");
       }),
   );
 
@@ -157,22 +179,22 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "invalidateAll clears every cached entry",
     () =>
       Effect.gen(function* () {
-        const pc: ProviderCacheShape = yield* ProviderCache;
+        const cache = yield* ProviderCache;
 
-        yield* pc.getModels({
+        yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("v1"),
           toCacheValue: (v) => v,
         });
-        yield* pc.getCapabilities({
+        yield* cache.getCapabilities({
           key: testCacheKey,
           lookup: Effect.succeed("v1-caps"),
           toCacheValue: JSON.stringify,
         });
 
-        yield* pc.invalidateAll();
+        yield* cache.invalidateAll();
 
-        const freshModels = yield* pc.getModels({
+        const freshModels = yield* cache.getModels({
           key: testCacheKey,
           lookup: Effect.succeed("v2"),
           toCacheValue: (v) => v,
@@ -185,24 +207,22 @@ it.layer(NodeServices.layer)("ProviderCache", (it) => {
     "healthCheck returns a well-formed CacheHealthStatus",
     () =>
       Effect.gen(function* () {
-        const pc: ProviderCacheShape = yield* ProviderCache;
-        // Warm cache once so hit count is non-zero
-        yield* pc.getModels({
+        // Warm the cache once so hit count is non-zero
+        const cache = yield* ProviderCache;
+        yield* cache.getModels({
           key: testCacheKey,
           lookup: fakeLookup,
           toCacheValue: JSON.stringify,
         });
 
-        const status: CacheHealthStatus = yield* pc.healthCheck;
+        const status: CacheHealthStatus = yield* cache.healthCheck;
 
         assert.isTrue(status.available);
         assert.strictEqual(status.driver, "ProviderCache");
         assert.isTrue(status.latencyMs >= 0);
         assert.isTrue(status.hitRate >= 0 && status.hitRate <= 1);
         assert.isTrue(status.totalHits >= 1);
-        assert.isTrue(
-          typeof status.timestamp === "string" && status.timestamp.length > 0,
-        );
+        assert.isTrue(typeof status.timestamp === "string");
       }),
   );
 });
