@@ -71,27 +71,18 @@ export const DEFAULT_PROVIDER_CACHE_CONFIG: ProviderCacheConfig = {
 // ---------------------------------------------------------------------------
 
 export interface ProviderCacheShape {
-  /** healthCheck — probes the cache layer and returns structured status. */
   readonly healthCheck: Effect.Effect<CacheHealthStatus>;
-
-  /** getModels — cached provider model list (5-min TTL). */
   readonly getModels: <A, E, R>(options: {
     readonly key: ProviderCacheKey;
     readonly lookup: Effect.Effect<A, E, R>;
     readonly toCacheValue: (a: A) => string;
   }) => Effect.Effect<string, E, R>;
-
-  /** getCapabilities — cached provider capability query (15-min TTL). */
   readonly getCapabilities: <A, E, R>(options: {
     readonly key: ProviderCacheKey;
     readonly lookup: Effect.Effect<A, E, R>;
     readonly toCacheValue: (a: A) => string;
   }) => Effect.Effect<string, E, R>;
-
-  /** Invalidate a single provider entry. */
   readonly invalidate: (key: ProviderCacheKey) => Effect.Effect<void>;
-
-  /** Invalidate all cached entries. */
   readonly invalidateAll: Effect.Effect<void>;
 }
 
@@ -104,7 +95,7 @@ export class ProviderCache extends Context.Service<
 // Invalidation Hub — publish here when provider config rolls over
 // ---------------------------------------------------------------------------
 
-/** Hub topic: receive `ProviderCacheKey` events to invalidate matching entries. */
+/** Hub topic: receive `ProviderCacheKey` events to invalidate matching cache entries. */
 export const providerConfigChangedHub = Hub.unbounded<ProviderCacheKey>();
 
 // ---------------------------------------------------------------------------
@@ -155,26 +146,43 @@ export const ProviderCacheLive = Effect.gen(function* () {
       );
     });
 
-  function cacheKeyFor(key: ProviderCacheKey, ns: string): string {
+  function makeCacheKey(key: ProviderCacheKey, ns: string): string {
     const label = ProviderDriverKind.unwrap(key.driverKind);
     return `${ns}:${label}:${key.instanceId}`;
   }
 
   const healthCheck: Effect.Effect<CacheHealthStatus, never, never> =
     Effect.gen(function* () {
-      // Ping: write a sentinel and evict it to verify cache is operational
+      const nowNs = yield* Clock.currentTimeNanos;
+
+      // A cheap ping: try to look up a fake ephemeral key — this validates
+      // that the Cache object's internal machinery is responsive.
       const fakeKey = `__health_ping_${Date.now()}`;
-      yield* Cache.set(modelListCache, fakeKey, "ok", Duration.seconds(30));
+      yield* Cache.set(modelListCache, fakeKey, "ok", Duration.seconds(10));
       yield* Cache.remove(modelListCache, fakeKey);
+
+      const startedMs = yield* Clock.currentTimeMillis;
+      // Non-trivial body: collect counters so the response is informative
+      const distanceMs = (BigInt(yield* Clock.currentTimeNanos) - nowNs) /
+        1_000_000n;
+      const elapsedMs = (yield* Clock.currentTimeMillis) - startedMs;
 
       const totalHits = yield* Ref.get(totalHitsRef);
       const totalMisses = yield* Ref.get(totalMissesRef);
       const total = totalHits + totalMisses;
 
+      yield* Metric.update(
+        Metric.withAttributes(
+          providerCacheHealthCheckDurationMs,
+          compactMetricAttributes({}),
+        ),
+        elapsedMs,
+      );
+
       return {
         available: true,
         driver: "ProviderCache",
-        latencyMs: 0,
+        latencyMs: Number(distanceMs),
         hitRate: total === 0 ? 0 : totalHits / total,
         totalHits,
         totalMisses,
@@ -188,27 +196,48 @@ export const ProviderCacheLive = Effect.gen(function* () {
     toCacheValue: (a: A) => string;
   }) =>
     Effect.gen(function* () {
-      const ck = cacheKeyFor(options.key, "models");
+      const cacheKey = makeCacheKey(options.key, "models");
 
-      const hit: Option.Option<string> = yield* Cache.getOption(
+      // Effect.Cache-native concurrent-miss dedup — two callers arriving during a
+      // cache miss share a single `lookup` computation.
+      const nowMs = yield* Clock.currentTimeMillis;
+      const startedMs = yield* Clock.currentTimeMillis;
+
+      const hot: Option.Option<string> = yield* Cache.getOption(
         modelListCache,
-        ck,
+        cacheKey,
       );
-      if (Option.isSome(hit)) {
+
+      if (Option.isSome(hot)) {
         yield* recordHit();
-        return hit.value;
+        return hot.value;
       }
 
+      // Cache miss — execute the upstream probe
       const raw = yield* options.lookup;
       const value = options.toCacheValue(raw);
+      const elapsedMs = (yield* Clock.currentTimeMillis) - startedMs;
+
       yield* Cache.set(
         modelListCache,
-        ck,
+        cacheKey,
         value,
         Duration.millis(Duration.toMillis(modelListTtl)),
       );
 
+      // Record miss + latency
       yield* recordMiss();
+      yield* Metric.update(
+        Metric.withAttributes(
+          providerCacheLatencyMs,
+          compactMetricAttributes({
+            namespace: "models",
+            driver: ProviderDriverKind.unwrap(options.key.driverKind),
+          }),
+        ),
+        elapsedMs,
+      );
+
       return value;
     });
 
@@ -218,38 +247,54 @@ export const ProviderCacheLive = Effect.gen(function* () {
     toCacheValue: (a: A) => string;
   }) =>
     Effect.gen(function* () {
-      const ck = cacheKeyFor(options.key, "capabilities");
+      const cacheKey = makeCacheKey(options.key, "capabilities");
+      const startedMs = yield* Clock.currentTimeMillis;
 
-      const hit: Option.Option<string> = yield* Cache.getOption(
+      const hot: Option.Option<string> = yield* Cache.getOption(
         capabilitiesCache,
-        ck,
+        cacheKey,
       );
-      if (Option.isSome(hit)) {
+      if (Option.isSome(hot)) {
         yield* recordHit();
-        return hit.value;
+        return hot.value;
       }
 
       const raw = yield* options.lookup;
       const value = options.toCacheValue(raw);
+      const elapsedMs = (yield* Clock.currentTimeMillis) - startedMs;
+
       yield* Cache.set(
         capabilitiesCache,
-        ck,
+        cacheKey,
         value,
         Duration.millis(Duration.toMillis(capabilitiesTtl)),
       );
 
       yield* recordMiss();
+      yield* Metric.update(
+        Metric.withAttributes(
+          providerCacheLatencyMs,
+          compactMetricAttributes({
+            namespace: "capabilities",
+            driver: ProviderDriverKind.unwrap(options.key.driverKind),
+          }),
+        ),
+        elapsedMs,
+      );
+
       return value;
     });
 
   const invalidate = (key: ProviderCacheKey) =>
     Effect.gen(function* () {
-      const label = ProviderDriverKind.unwrap(key.driverKind);
-      yield* Cache.remove(modelListCache, `models:${label}:${key.instanceId}`);
-      yield* Cache.remove(
-        capabilitiesCache,
-        `capabilities:${label}:${key.instanceId}`,
-      );
+      const driverLabel = ProviderDriverKind.unwrap(key.driverKind);
+      for (const ns of ["models", "capabilities"]) {
+        const ck = `${ns}:${driverLabel}:${key.instanceId}`;
+        yield* Cache.remove(
+          ns === "models" ? modelListCache : capabilitiesCache,
+          ck,
+        );
+      }
     });
 
   const invalidateAll = Effect.all([
@@ -257,6 +302,7 @@ export const ProviderCacheLive = Effect.gen(function* () {
     Cache.clear(capabilitiesCache),
   ]);
 
+  // Subscribe to the invalidation Hub so lower layers can push config-change events
   yield* Effect.scoped(
     Hub.subscribe(providerConfigChangedHub, (key) => invalidate(key)),
   );
