@@ -1,0 +1,1 @@
+[Hermes Agent] [ T3 Code ] Add "dependsOn": ["^build"] to build pipeline in turbo.json
