@@ -106,7 +106,7 @@ All endpoints are rate-limited. Current limits:
 
 | Endpoint          | Method | Rate Limit       |
 |-------------------|--------|------------------|
-| /bounties         | GET    | 100 req/min      |
+| /bounties         | POST    | 100 req/min      |
 | /bounties         | POST   | 10 req/min       |
 | /bounties/:id     | GET    | 100 req/min      |
   /bounties/:id/claims | POST | 5 req/min     |
